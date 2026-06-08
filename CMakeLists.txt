@@ -1,9 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(hive_ogi_linux CXX)
+include_directories(/home/hivesystem/workspace/rc_genicam_api/genicam/library/CPP/include)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# [수정됨] 라즈베리파이 CM5 (Cortex-A76) 하드웨어 최적화 플래그 추가
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mcpu=cortex-a76 -mtune=cortex-a76 -ffast-math")
 
 include(FetchContent)
 
@@ -37,8 +41,15 @@ find_package(OpenCV REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 
+# 라즈베리파이(ARM64) 빌드 시 rc_genicam_api가 설치되는 전용 경로들을 탐색 목록에 강제 추가
+list(APPEND CMAKE_PREFIX_PATH 
+    "/usr/local/lib/cmake/rc_genicam_api"
+    "/usr/local/lib/aarch64-linux-gnu/cmake/rc_genicam_api"
+    "/usr/local/share/rc_genicam_api"
+)
+
 # 설치된 시스템 라이브러리를 찾습니다.
-find_package(rc_genicam_api REQUIRED)
+find_package(RC_GENICAM_API REQUIRED)
 
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     "src/*.cpp"
@@ -52,6 +63,9 @@ target_include_directories(hive_ogi_linux PRIVATE
 
 target_link_libraries(hive_ogi_linux PRIVATE
     imgui_lib
-    OpenGL::GL
+    # [수정됨] 데스크톱 OpenGL::GL 대신 라즈베리파이 하드웨어 가속을 위한 GLESv2 링크
+    GLESv2
     ${OpenCV_LIBS}
     rc_genicam_api)
+
+target_link_libraries(hive_ogi_linux PRIVATE rc_genicam_api)

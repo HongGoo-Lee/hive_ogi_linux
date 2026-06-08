@@ -8,6 +8,7 @@
 #include <rc_genicam_api/stream.h>
 #include <rc_genicam_api/buffer.h>
 #include <rc_genicam_api/config.h>
+#include <rc_genicam_api/exception.h>
 
 #include <chrono>
 #include <cstdint>
@@ -47,6 +48,8 @@ bool setPixelFormat(std::shared_ptr<GenApi::CNodeMapRef> nodemap) {
 struct CameraManager::Impl {
     std::shared_ptr<rcg::Device> device;
     std::shared_ptr<rcg::Stream> stream;
+    std::shared_ptr<rcg::System> currentSystem;
+    std::shared_ptr<rcg::Interface> currentInterface;
     bool isStreaming = false;
     std::string deviceId;
     std::string modelName = "Unknown";
@@ -75,7 +78,7 @@ int CameraManager::searchCameras() {
             for (auto& interf : sys->getInterfaces()) {
                 interf->open();
                 auto devices = interf->getDevices();
-                count += devices.size();
+                count += static_cast<int>(devices.size());
                 interf->close();
             }
             sys->close();
@@ -90,50 +93,53 @@ int CameraManager::searchCameras() {
 bool CameraManager::connectCamera() {
     LOG_INFO("[TRACE] connectCamera - Start");
 
-    const char* cameraIp = std::getenv("HIVE_CAMERA_IP");
-    try {
-        if (cameraIp && cameraIp[0] != '\0') {
-            impl_->deviceId = cameraIp;
-            LOG_INFO("[TRACE] connectCamera - Using HIVE_CAMERA_IP=" + impl_->deviceId);
-            impl_->device = rcg::getDevice(impl_->deviceId.c_str());
-        } else {
-            LOG_INFO("[TRACE] connectCamera - Searching for device ID...");
-            auto systems = rcg::System::getSystems();
-            for (auto& sys : systems) {
-                sys->open();
-                for (auto& interf : sys->getInterfaces()) {
-                    interf->open();
-                    auto devices = interf->getDevices();
-                    if (!devices.empty()) {
-                        impl_->device = devices[0];
-                        impl_->deviceId = impl_->device->getID();
-                        LOG_INFO("[TRACE] connectCamera - Found device ID=" + impl_->deviceId);
-                        break;
-                    }
+    // Windows 버전의 깔끔한 탐색(Auto-Discovery) 구조 적용
+    auto systems = rcg::System::getSystems();
+    for (auto& sys : systems) {
+        sys->open();
+        auto interfaces = sys->getInterfaces();
+
+        for (auto& inter : interfaces) {
+            inter->open();
+            auto devices = inter->getDevices();
+
+            if (!devices.empty()) {
+                // 첫 번째 발견된 디바이스 할당
+                impl_->device = devices[0]; 
+                impl_->deviceId = impl_->device->getID();
+                impl_->currentSystem = sys;
+                impl_->currentInterface = inter;
+
+                LOG_INFO("[TRACE] connectCamera - Found device ID: " + impl_->deviceId);
+
+                try {
+                    impl_->device->open(rcg::Device::CONTROL);
+                    LOG_INFO("[TRACE] connectCamera - Connected!");
+
+                    // 기존 Linux 버전에 있던 모델/시리얼 수집 로직 통합
+                    auto nodemap = impl_->device->getRemoteNodeMap();
+                    impl_->modelName = rcg::getString(nodemap, "DeviceModelName", true, "Unknown");
+                    impl_->serialNumber = rcg::getString(nodemap, "DeviceSerialNumber", true, "Unknown");
+
+                    return true;
                 }
-                if (impl_->device) break;
+                catch (const rcg::GenTLException& e) {
+                    LOG_ERROR(std::string("[Camera Error] Failed to open device (GenTL): ") + e.what());
+                    return false;
+                }
+                catch (const std::exception& e) {
+                    LOG_ERROR(std::string("[Camera Error] Unexpected error: ") + e.what());
+                    return false;
+                }
             }
+            // 디바이스를 찾지 못했으면 안전하게 닫기
+            inter->close();
         }
-
-        if (!impl_->device) {
-            LOG_ERROR("[TRACE] connectCamera - No device found via rc_genicam_api");
-            return false;
-        }
-
-        LOG_INFO("[TRACE] connectCamera - device->open() calling...");
-        impl_->device->open(rcg::Device::CONTROL);
-
-        LOG_INFO("[TRACE] connectCamera - Getting model and serial...");
-        auto nodemap = impl_->device->getRemoteNodeMap();
-        impl_->modelName = rcg::getString(nodemap, "DeviceModelName", true, "Unknown");
-        impl_->serialNumber = rcg::getString(nodemap, "DeviceSerialNumber", true, "Unknown");
-
-        LOG_INFO("[TRACE] connectCamera - End (Success)");
-        return true;
-    } catch (const std::exception& e) {
-        LOG_ERROR(std::string("[TRACE] connectCamera - Failed to open camera: ") + e.what());
-        return false;
+        sys->close();
     }
+
+    LOG_ERROR("[TRACE] connectCamera - No device found across any interface");
+    return false;
 }
 
 bool CameraManager::startStreaming() {
@@ -153,10 +159,13 @@ bool CameraManager::startStreaming() {
         }
 
         impl_->stream = streams[0];
-        impl_->stream->open();
-
+        if (!impl_->stream) {
+            LOG_ERROR("[TRACE] startStreaming - Failed to get stream");
+            return false;
+        }
+        
         LOG_INFO("[TRACE] startStreaming - stream->startStreaming() calling...");
-        // rc_genicam_api는 버퍼 할당 및 관리를 내부에서 자동으로 처리합니다.
+        impl_->stream->open();
         impl_->stream->startStreaming();
 
         LOG_INFO("[TRACE] startStreaming - AcquisitionStart calling...");
@@ -218,25 +227,28 @@ bool CameraManager::autoConnectAndStart() {
         return false;
     }
 
+    auto nodemap = impl_->device->getRemoteNodeMap();
+
     try {
-        auto nodemap = impl_->device->getRemoteNodeMap();
-        setPixelFormat(nodemap);
-
-        LOG_INFO("[TRACE] autoConnectAndStart - set AcquisitionMode to Continuous...");
-        rcg::setEnum(nodemap, "AcquisitionMode", "Continuous", true);
-    } catch (const std::exception& e) {
-        LOG_WARN(std::string("[TRACE] autoConnectAndStart - set mode warning: ") + e.what());
+        rcg::setEnum(nodemap, "TestPattern", "Off", true);
     }
-
-    LOG_INFO("[TRACE] autoConnectAndStart - Calling startStreaming()...");
-    const bool started = startStreaming();
-    if (!started) {
-        LOG_INFO("[TRACE] autoConnectAndStart - startStreaming failed, ensuring teardown");
-        stopStreaming();
+    catch (...) {
+        try {
+            rcg::setEnum(nodemap, "TestImageSelector", "Off", true);
+        }
+        catch (...) {
+        }
     }
-
-    LOG_INFO(std::string("[TRACE] autoConnectAndStart - End result=") + (started ? "success" : "failed"));
-    return started;
+    for (const char* pixelFormat : {"Mono16", "Mono14", "Mono12", "Mono8"}) {
+        try {
+            rcg::setEnum(nodemap, "PixelFormat", pixelFormat, true);
+            std::cout << "[Camera] PixelFormat => " << pixelFormat << std::endl;
+            break;
+        }
+        catch (...) {
+        }
+    }
+    return startStreaming();
 }
 
 cv::Mat CameraManager::grabFrame(int timeout_ms) {
@@ -258,11 +270,11 @@ cv::Mat CameraManager::grabFrame(int timeout_ms) {
         }
 
         cv::Mat frame;
-        size_t size = buffer->getSize();
-        const void* data = buffer->getBase();
-        const int width = static_cast<int>(buffer->getWidth());
-        const int height = static_cast<int>(buffer->getHeight());
-        const uint64_t pixelFormat = buffer->getPixelFormat(); 
+        size_t size = buffer->getSize(0);
+        const void* data = buffer->getBase(0);
+        const int width = static_cast<int>(buffer->getWidth(0));
+        const int height = static_cast<int>(buffer->getHeight(0));
+        const uint64_t pixelFormat = buffer->getPixelFormat(0); 
 
         if (!impl_->loggedFirstFrame) {
             LOG_INFO("[TRACE] grabFrame - FIRST FRAME SUCCESS width=" + std::to_string(width) + " height=" + std::to_string(height));
