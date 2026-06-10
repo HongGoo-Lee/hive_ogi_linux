@@ -1,31 +1,42 @@
-#pragma once
+#ifndef RECORD_MANAGER_H
+#define RECORD_MANAGER_H
+
 #include <opencv2/opencv.hpp>
+#include <string>
+#include <chrono>
+#include <mutex>
 #include <thread>
 #include <atomic>
-#include <string>
-#include "../Common/HiveConfig.h"
+#include <queue>
 
 class RecordManager {
 private:
-    std::atomic<cv::Mat*> sharedFramePtr{ nullptr }; 
-    
-    std::atomic<bool> isRunning{ false };
-    std::atomic<bool> isRecording{ false };
-    std::thread recordThread;
-    
-    void recordingLoop(); 
+    cv::VideoWriter writer;
+    std::string recordDir = "./Records/";
+    std::atomic<bool> isRecording{false};
+
+    // 5분 분할 저장을 위한 시간 추적 변수
+    std::chrono::system_clock::time_point currentChunkStartTime;
+    const int CHUNK_DURATION_MINUTES = 5;
+
+    // 비동기 처리를 위한 스레드 및 큐
+    std::queue<cv::Mat> frameQueue;
+    std::mutex queueMutex;
+    std::thread writerThread;
+    std::atomic<bool> isRunning{false};
+
+    void CheckAndRestartChunk();
+    void WriterLoop();
 
 public:
-    RecordManager() = default;
+    RecordManager();
     ~RecordManager();
 
     void startThread();
     void stopThread();
-
-    void startRecording();
-    void stopRecording();
-
-    void updateFrame(const cv::Mat& frame);
-
-    bool getIsRecording() const { return isRecording; }
+    void StartRecording();
+    void StopRecording();
+    void ProcessFrame(const cv::Mat& frame);
 };
+
+#endif // RECORD_MANAGER_H

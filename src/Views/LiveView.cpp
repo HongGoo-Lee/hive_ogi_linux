@@ -8,7 +8,13 @@
 #include <sstream>
 
 LiveView::LiveView(MainView* parent, MainViewModel* vm)
-    : parentView(parent), viewModel(vm) {}
+    : parentView(parent), viewModel(vm) 
+{
+    // 프로그램이 켜지자마자 자동으로 Auto Connect와 녹화를 시작합니다.
+    viewModel->AutoConnect();
+    viewModel->StartRecording();
+    isRecording = true;
+}
 
 void LiveView::Render() {
     float winW = ImGui::GetWindowWidth();
@@ -20,15 +26,16 @@ void LiveView::Render() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(12.f/255.f, 15.f/255.f, 20.f/255.f, 1.f));
     ImGui::SetCursorPos(ImVec2(0, 0));
     ImGui::BeginChild("Header", ImVec2(winW, headerH), false, ImGuiWindowFlags_NoScrollbar);
+    
     float textY = (headerH - ImGui::GetTextLineHeight()) * 0.5f;
     ImGui::SetCursorPos(ImVec2(pad, textY));
     ImGui::TextColored(COL_ACCENT, "%s", parentView->GetWindowTitle().c_str());
 
-    // 녹화 중일 때 우측 상단에 깜빡이는 빨간색 텍스트(점) 표시
+    // 녹화(ON) 상태일 때 우측 상단에 깜빡이는 빨간색 텍스트(점) 표시
     if (isRecording) {
         ImVec2 recTextSize = ImGui::CalcTextSize("● REC");
         ImGui::SetCursorPos(ImVec2(winW - pad - recTextSize.x, textY));
-        // ImGui::GetTime()을 이용해 1초 주기로 깜빡이는 애니메이션 효과
+        // ImGui::GetTime()을 이용해 1초 주기로 깜빡이는 애니메이션
         if (static_cast<int>(ImGui::GetTime() * 2) % 2 == 0) {
             ImGui::TextColored(COL_RED, "● REC");
         } else {
@@ -39,10 +46,10 @@ void LiveView::Render() {
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
-    // 공간 분배 계산 (2x3 그리드에 맞게 버튼 영역 높이 수정)
+    // 2x3 구조 공간 분배 계산
     float statusH = ImGui::GetTextLineHeight() + pad;
     float btnRowH = 75.0f;                            
-    float btnAreaH = (btnRowH * 3) + (pad * 2); // 버튼 3줄 기준의 높이 계산
+    float btnAreaH = (btnRowH * 3) + (pad * 2); // 버튼 3줄
     
     float vbh = winH - headerH - btnAreaH - statusH - (pad * 4); 
     float vbw = winW - (pad * 2); 
@@ -74,15 +81,15 @@ void LiveView::Render() {
         ImGui::PopStyleColor();
     }
 
-    // 3. 버튼 배치 (2열 3행 - 2x3 배열로 변경)
-    float btnW = (winW - (pad * 3)) * 0.5f; // 좌, 우, 가운데 여백(3개)을 뺀 너비 절반
+    // 3. 버튼 배치 (2열 3행)
+    float btnW = (winW - (pad * 3)) * 0.5f; 
     float btnStartY = headerH + pad + vbh + pad; 
 
     ImGui::PushStyleColor(ImGuiCol_Button, COL_SURFACE);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_PANEL);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, COL_CARD);
 
-    // [첫 번째 줄 버튼 (Row 1)]
+    // [첫 번째 줄 버튼]
     ImGui::SetCursorPos(ImVec2(pad, btnStartY));
     ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT);
     if (ImGui::Button("Snapshot", ImVec2(btnW, btnRowH))) {
@@ -102,7 +109,7 @@ void LiveView::Render() {
     }
     ImGui::PopStyleColor(); 
 
-    // [두 번째 줄 버튼 (Row 2)]
+    // [두 번째 줄 버튼]
     float row2Y = btnStartY + btnRowH + pad; 
     ImGui::SetCursorPos(ImVec2(pad, row2Y));
     if (ImGui::Button("Menu", ImVec2(btnW, btnRowH))) {
@@ -110,31 +117,39 @@ void LiveView::Render() {
 
     ImGui::SetCursorPos(ImVec2(pad + btnW + pad, row2Y));
     
-    // 녹화(Record) 버튼 토글 색상 상태 관리
-    if (isRecording) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.0f, 0.0f, 1.0f)); // 켜져있을 땐 어두운 빨간 배경
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_RED); // 글씨는 빨간색
+    // --- [수정된 부분] 버튼 클릭 전의 상태를 저장해둡니다 ---
+    bool isRecordingColorPushed = isRecording; 
+    
+    // 토글 버튼 상태에 따른 색상 변경
+    if (isRecordingColorPushed) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.0f, 0.0f, 1.0f)); 
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_RED); 
     }
+    // RECORD 토글 버튼
     if (ImGui::Button(isRecording ? "RECORD [ON]" : "RECORD [OFF]", ImVec2(btnW, btnRowH))) {
-        isRecording = !isRecording; // 상태 반전
-        
-        // 상태에 맞춰 ViewModel의 함수 호출
+        isRecording = !isRecording; // 여기서 상태가 반전됩니다
         if (isRecording) {
             viewModel->StartRecording();
         } else {
+            // OFF가 되면 즉각 영상을 저장하고 종료합니다.
             viewModel->StopRecording();
         }
     }
-    if (isRecording) ImGui::PopStyleColor(2);
+    
+    // 이전에 색상을 푸시했다면 상태가 바뀌었든 안 바뀌었든 무조건 팝(해제)합니다.
+    if (isRecordingColorPushed) {
+        ImGui::PopStyleColor(2);
+    }
+    // -----------------------------------------------------------
 
-    // [세 번째 줄 버튼 (Row 3)]
+    // [세 번째 줄 버튼]
     float row3Y = row2Y + btnRowH + pad; 
     ImGui::SetCursorPos(ImVec2(pad, row3Y));
     if (ImGui::Button("Btn 1", ImVec2(btnW, btnRowH))) {
     }
 
     ImGui::SetCursorPos(ImVec2(pad + btnW + pad, row3Y));
-    if (ImGui::Button("Btn 2", ImVec2(btnW, btnRowH))) {
+    if (ImGui::Button("Btn 2 (AUTO CONN)", ImVec2(btnW, btnRowH))) {
          if (!viewModel->AutoConnect()) showCamAlert = true;
     }
 

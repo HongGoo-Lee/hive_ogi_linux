@@ -20,7 +20,7 @@ private:
     std::string snapshotMessage;
     float toastTimer = 0.0f;
 
-    bool isRecording = false; // 추가: 녹화 상태 관리용 변수
+    bool isRecording = true; // 추가: 녹화 상태 관리용 변수
 
     void ShowToastNotification();
 

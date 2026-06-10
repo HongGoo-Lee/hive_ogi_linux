@@ -1,20 +1,28 @@
-#pragma once
-#include <atomic>
+#ifndef DISK_MANAGER_H
+#define DISK_MANAGER_H
+
+#include <string>
 #include <thread>
-#include "../Common/HiveConfig.h"
+#include <atomic>
 
 class DiskManager {
 private:
-    std::atomic<bool> isRunning{ false };
-    std::thread mgrThread;
+    std::string recordDirectory = "./Records/";
+    const double MAX_STORAGE_USAGE_PERCENT = 50.0; // 사용량 제한 50%
+    
+    std::thread monitorThread;
+    std::atomic<bool> isRunning{false};
 
-    void performCleanup();
-    void threadLoop();
+    void MonitorLoop();
+    void CheckStorageSpace();
+    void DeleteOldestVideo();
 
 public:
+    DiskManager();
     ~DiskManager();
 
     void start();
     void stop();
-    void checkAndCleanupNow();
 };
+
+#endif // DISK_MANAGER_H

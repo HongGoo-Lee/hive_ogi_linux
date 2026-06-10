@@ -78,7 +78,7 @@ int CameraManager::searchCameras() {
             for (auto& interf : sys->getInterfaces()) {
                 interf->open();
                 auto devices = interf->getDevices();
-                count += static_cast<int>(devices.size());
+                count += static_cast<int>(devices.size()); // 다시 모든 장치를 카운트하도록 복구
                 interf->close();
             }
             sys->close();
@@ -93,7 +93,6 @@ int CameraManager::searchCameras() {
 bool CameraManager::connectCamera() {
     LOG_INFO("[TRACE] connectCamera - Start");
 
-    // Windows 버전의 깔끔한 탐색(Auto-Discovery) 구조 적용
     auto systems = rcg::System::getSystems();
     for (auto& sys : systems) {
         sys->open();
@@ -104,7 +103,7 @@ bool CameraManager::connectCamera() {
             auto devices = inter->getDevices();
 
             if (!devices.empty()) {
-                // 첫 번째 발견된 디바이스 할당
+                // 원래대로 가장 먼저 발견된 장치(실제 카메라 모듈)를 사용합니다.
                 impl_->device = devices[0]; 
                 impl_->deviceId = impl_->device->getID();
                 impl_->currentSystem = sys;
@@ -116,12 +115,37 @@ bool CameraManager::connectCamera() {
                     impl_->device->open(rcg::Device::CONTROL);
                     LOG_INFO("[TRACE] connectCamera - Connected!");
 
-                    // 기존 Linux 버전에 있던 모델/시리얼 수집 로직 통합
                     auto nodemap = impl_->device->getRemoteNodeMap();
                     impl_->modelName = rcg::getString(nodemap, "DeviceModelName", true, "Unknown");
                     impl_->serialNumber = rcg::getString(nodemap, "DeviceSerialNumber", true, "Unknown");
 
-                    return true;
+                    // --- [핵심 수정 부분] 라즈베리파이 MTU 한계(1500)에 맞춰 카메라 패킷 사이즈 강제 조정 ---
+                    try {
+                        rcg::setInteger(nodemap, "GevSCPSPacketSize", 1400, true);
+                        LOG_INFO("[TRACE] Forced Network Packet Size (GevSCPSPacketSize) to 1400 for Raspberry Pi stability.");
+                    } catch (...) {
+                        LOG_WARN("[TRACE] Could not force packet size. If empty frames persist, check Jumbo Frame settings.");
+                    }
+
+                    // --- 라즈베리파이 기가비트 이더넷 과부하 방지를 위한 패킷 딜레이 설정 ---
+                    try {
+                        rcg::setInteger(nodemap, "GevSCPD", 2000, true);
+                    } catch (...) {}
+
+                    // --- [해결 부분] 연결 후 카메라의 영상 스트리밍을 곧바로 시작하게 만듭니다. ---
+                    try { rcg::setEnum(nodemap, "TestPattern", "Off", true); } catch(...) {}
+                    try { rcg::setEnum(nodemap, "TestImageSelector", "Off", true); } catch(...) {}
+
+                    for (const char* pixelFormat : {"Mono16", "Mono14", "Mono12", "Mono8"}) {
+                        try {
+                            rcg::setEnum(nodemap, "PixelFormat", pixelFormat, true);
+                            LOG_INFO(std::string("[TRACE] PixelFormat set to: ") + pixelFormat);
+                            break;
+                        } catch (...) {}
+                    }
+
+                    // 이제 연결이 끝나면 멈추는게 아니라 스트리밍을 바로 시작(Return) 합니다!
+                    return startStreaming();
                 }
                 catch (const rcg::GenTLException& e) {
                     LOG_ERROR(std::string("[Camera Error] Failed to open device (GenTL): ") + e.what());
@@ -132,7 +156,6 @@ bool CameraManager::connectCamera() {
                     return false;
                 }
             }
-            // 디바이스를 찾지 못했으면 안전하게 닫기
             inter->close();
         }
         sys->close();
@@ -222,33 +245,8 @@ void CameraManager::stopStreaming() {
 
 bool CameraManager::autoConnectAndStart() {
     LOG_INFO("[TRACE] autoConnectAndStart - Start");
-    if (!connectCamera()) {
-        LOG_ERROR("[TRACE] autoConnectAndStart - connectCamera failed");
-        return false;
-    }
-
-    auto nodemap = impl_->device->getRemoteNodeMap();
-
-    try {
-        rcg::setEnum(nodemap, "TestPattern", "Off", true);
-    }
-    catch (...) {
-        try {
-            rcg::setEnum(nodemap, "TestImageSelector", "Off", true);
-        }
-        catch (...) {
-        }
-    }
-    for (const char* pixelFormat : {"Mono16", "Mono14", "Mono12", "Mono8"}) {
-        try {
-            rcg::setEnum(nodemap, "PixelFormat", pixelFormat, true);
-            std::cout << "[Camera] PixelFormat => " << pixelFormat << std::endl;
-            break;
-        }
-        catch (...) {
-        }
-    }
-    return startStreaming();
+    // 이제 connectCamera() 내부에서 startStreaming()까지 모두 호출해주므로 단순화됩니다.
+    return connectCamera();
 }
 
 cv::Mat CameraManager::grabFrame(int timeout_ms) {
@@ -264,8 +262,12 @@ cv::Mat CameraManager::grabFrame(int timeout_ms) {
             return cv::Mat();
         }
 
+        // --- [빈 프레임 원인] 데이터 패킷 드롭으로 인한 불완전 버퍼 로그 ---
         if (buffer->getIsIncomplete()) {
             impl_->badStatusCount++;
+            if (impl_->badStatusCount % 30 == 1) { // 로그 폭주 방지
+                LOG_WARN("[CameraManager] Incomplete Buffer detected! Packet lost due to network MTU issues.");
+            }
             return cv::Mat();
         }
 
@@ -282,17 +284,26 @@ cv::Mat CameraManager::grabFrame(int timeout_ms) {
         }
 
         if (data && width > 0 && height > 0) {
-            // GenICam PFNC 0x01100007은 Mono16을 의미합니다.
-            if (pixelFormat == 0x01100007 && size >= static_cast<size_t>(width) * height * 2) {
-                // rc_genicam_api의 buffer 메모리는 copyTo를 통해 복사되므로 별도의 메모리 관리가 필요하지 않습니다.
-                cv::Mat(height, width, CV_16UC1, const_cast<void*>(data)).copyTo(frame);
+            // GenICam PFNC 포맷 파싱 로직 및 안전한 복사
+            // Mono16 (0x01100007) 또는 16비트 Mono 데이터를 처리
+            if (pixelFormat == 0x01100007) {
+                cv::Mat temp(height, width, CV_16UC1, const_cast<void*>(data));
+                temp.copyTo(frame);
             }
-            else if (size >= static_cast<size_t>(width) * height) {
-                cv::Mat(height, width, CV_8UC1, const_cast<void*>(data)).copyTo(frame);
+            // 8비트 데이터 처리
+            else if (pixelFormat == 0x01080008 || pixelFormat == 0x01080009) {
+                cv::Mat temp(height, width, CV_8UC1, const_cast<void*>(data));
+                temp.copyTo(frame);
+            }
+            // 알 수 없는 포맷인 경우라도 안전하게 복사 시도
+            else {
+                cv::Mat temp(height, width, CV_8UC1, const_cast<void*>(data));
+                temp.copyTo(frame);
             }
         }
         return frame;
     } catch (const std::exception& e) {
+        LOG_ERROR(std::string("[Camera Error] grabFrame Exception: ") + e.what());
         impl_->timeoutCount++;
         return cv::Mat();
     }

@@ -1,138 +1,124 @@
 #include "RecordManager.h"
-#include "../Common/Logger.h"
-
-#include <chrono>
-#include <ctime>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
+#include <iomanip>
 
-namespace {
-std::tm localTime(std::time_t value) {
-    std::tm result{};
-    localtime_r(&value, &result);
-    return result;
-}
+namespace fs = std::filesystem;
+
+RecordManager::RecordManager() {
+    // 디렉토리가 없으면 자동 생성
+    if (!fs::exists(recordDir)) {
+        fs::create_directories(recordDir);
+    }
 }
 
 RecordManager::~RecordManager() {
-    LOG_INFO("RecordManager destructor called. Cleaning up...");
     stopThread();
-
-    cv::Mat* leftover = sharedFramePtr.exchange(nullptr);
-    delete leftover;
 }
 
 void RecordManager::startThread() {
-    if (!isRunning) {
-        isRunning = true;
-        recordThread = std::thread(&RecordManager::recordingLoop, this);
-        LOG_INFO("RecordManager thread started");
-    }
+    isRunning = true;
+    writerThread = std::thread(&RecordManager::WriterLoop, this);
 }
 
 void RecordManager::stopThread() {
-    if (isRunning) {
-        isRunning = false;
-        if (recordThread.joinable()) {
-            recordThread.join();
-        }
-        LOG_INFO("RecordManager thread stopped");
+    isRunning = false;
+    if (writerThread.joinable()) {
+        writerThread.join();
+    }
+    if (isRecording) {
+        StopRecording();
     }
 }
 
-void RecordManager::startRecording() {
-    isRecording = true;
-    LOG_INFO("RecordManager recording enabled");
-}
+void RecordManager::StartRecording() {
+    std::lock_guard<std::mutex> lock(queueMutex);
+    if (isRecording) return;
 
-void RecordManager::stopRecording() {
-    isRecording = false;
-    LOG_INFO("RecordManager recording disabled");
-}
-
-void RecordManager::updateFrame(const cv::Mat& frame) {
-    if (frame.empty()) {
-        return;
-    }
-
-    cv::Mat* newFrame = new cv::Mat();
-    frame.copyTo(*newFrame);
-
-    cv::Mat* oldFrame = sharedFramePtr.exchange(newFrame);
-    delete oldFrame;
-}
-
-void RecordManager::recordingLoop() {
-    cv::VideoWriter writer;
-    auto lastSegmentTime = std::chrono::steady_clock::now();
-    cv::Mat frameToWrite;
-
-    while (isRunning) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-        if (!isRecording) {
-            if (writer.isOpened()) {
-                writer.release();
-                LOG_INFO("Recording writer released");
-            }
-            continue;
-        }
-
-        cv::Mat* grabbedFrame = sharedFramePtr.exchange(nullptr);
-        if (grabbedFrame) {
-            frameToWrite = std::move(*grabbedFrame);
-            delete grabbedFrame;
-        }
-
-        if (frameToWrite.empty()) {
-            continue;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        bool startNewFile = !writer.isOpened();
-
-        if (writer.isOpened()) {
-            const auto duration =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSegmentTime).count();
-            if (duration >= HiveConfig::REC_SEGMENT_DURATION_MS) {
-                writer.release();
-                startNewFile = true;
-            }
-        }
-
-        if (startNewFile) {
-            const auto t_now = std::chrono::system_clock::now();
-            const std::time_t now_c = std::chrono::system_clock::to_time_t(t_now);
-            std::tm parts = localTime(now_c);
-
-            char dateBuf[20];
-            char timeBuf[20];
-            std::strftime(dateBuf, sizeof(dateBuf), "%Y%m%d", &parts);
-            std::strftime(timeBuf, sizeof(timeBuf), "%H%M%S", &parts);
-
-            const std::filesystem::path dirPath = std::filesystem::path(HiveConfig::BASE_DIR) / dateBuf;
-            std::filesystem::create_directories(dirPath);
-
-            const std::filesystem::path filePath = dirPath / (std::string(timeBuf) + ".avi");
-
-            writer.open(filePath.string(), cv::CAP_FFMPEG, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
-                20.0, frameToWrite.size(), false);
-
-            if (writer.isOpened()) {
-                LOG_INFO("Recording new segment: " + filePath.string());
-                lastSegmentTime = now;
-            }
-            else {
-                LOG_ERROR("Recording failed to open: " + filePath.string());
-            }
-        }
-
-        if (writer.isOpened()) {
-            writer.write(frameToWrite);
-        }
-    }
-
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm = *std::localtime(&t);
+    
+    std::ostringstream oss;
+    oss << recordDir << "REC_" << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".avi";
+    
+    // 리눅스/라즈베리파이 환경에서 안정적인 기본 코덱 MJPG
+    int codec = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    writer.open(oss.str(), codec, 30.0, cv::Size(640, 512), true);
+    
     if (writer.isOpened()) {
-        writer.release();
+        isRecording = true;
+        currentChunkStartTime = now; // 녹화 시작 시점 기록
+        std::cout << "[RecordManager] Started recording: " << oss.str() << std::endl;
+    } else {
+        std::cerr << "[RecordManager] Failed to open VideoWriter." << std::endl;
+    }
+}
+
+void RecordManager::StopRecording() {
+    std::lock_guard<std::mutex> lock(queueMutex);
+    if (!isRecording) return;
+    
+    isRecording = false;
+    if (writer.isOpened()) {
+        writer.release(); // 정상적으로 파일 저장 및 닫기
+        std::cout << "[RecordManager] Stopped recording. Video Saved." << std::endl;
+    }
+    
+    // 남은 큐 비우기
+    std::queue<cv::Mat> empty;
+    std::swap(frameQueue, empty);
+}
+
+// 5분이 경과했는지 검사하고 맞다면 새로운 파일로 이어 그립니다.
+void RecordManager::CheckAndRestartChunk() {
+    auto now = std::chrono::system_clock::now();
+    auto elapsedMinutes = std::chrono::duration_cast<std::chrono::minutes>(now - currentChunkStartTime).count();
+    
+    if (elapsedMinutes >= CHUNK_DURATION_MINUTES) {
+        std::cout << "[RecordManager] 5 minutes elapsed. Restarting chunk." << std::endl;
+        
+        // 큐 뮤텍스를 재잠금하지 않고 스레드 내부에서 직접 재시작 수행
+        if (writer.isOpened()) writer.release();
+        
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::localtime(&t);
+        std::ostringstream oss;
+        oss << recordDir << "REC_" << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".avi";
+        
+        int codec = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+        writer.open(oss.str(), codec, 30.0, cv::Size(640, 512), true);
+        currentChunkStartTime = now;
+    }
+}
+
+void RecordManager::ProcessFrame(const cv::Mat& frame) {
+    if (!isRecording || frame.empty()) return;
+    
+    std::lock_guard<std::mutex> lock(queueMutex);
+    frameQueue.push(frame.clone());
+}
+
+void RecordManager::WriterLoop() {
+    while (isRunning) {
+        cv::Mat frame;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (isRecording && !frameQueue.empty()) {
+                frame = frameQueue.front();
+                frameQueue.pop();
+                
+                // 프레임을 쓰기 전에 5분 초과 검사 진행
+                CheckAndRestartChunk();
+            }
+        }
+        
+        if (!frame.empty() && writer.isOpened()) {
+            writer.write(frame);
+        } else {
+            // CPU 점유율을 낮추기 위한 휴식
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 }

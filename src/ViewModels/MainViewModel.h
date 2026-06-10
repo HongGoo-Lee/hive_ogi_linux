@@ -1,41 +1,45 @@
 #ifndef MAIN_VIEW_MODEL_H
 #define MAIN_VIEW_MODEL_H
-#include "../Models/RecordManager.h"
-#include "../Models/ImageProcessor.h"
-#include "../Models/DiskManager.h"
+
 #include "../Models/CameraManager.h"
-#include <string>
+#include "../Models/ImageProcessor.h"
+#include "../Models/RecordManager.h"
+#include "../Models/DiskManager.h"
 #include <opencv2/opencv.hpp>
+#include <string>
 
 class MainViewModel {
 private:
+    // main.cpp에서 넘겨준 인스턴스를 참조(&)로 받아서 사용하도록 수정
     CameraManager& camMgr;
     ImageProcessor& imgProc;
     RecordManager& recMgr;
     DiskManager& diskMgr;
 
-    cv::Mat lastProcessedMonoFrame;
-    bool isLeakBtn;
-    std::string currentStatus;
+    std::string currentStatus = "Disconnected";
+    bool isConnected = false;
+    bool isLeakBtn = false;
 
-    void updateStatus(const std::string& status);
-    void GetTimeStrings(std::string& dateStr, std::string& timeStr);
+    std::string GetCurrentTimeString();
 
 public:
+    // 생성자 인자로 4개의 매니저 객체 참조를 받도록 수정
     MainViewModel(CameraManager& cm, ImageProcessor& ip, RecordManager& rm, DiskManager& dm);
+    ~MainViewModel();
 
-    // View에서 바인딩할 커맨드
     bool AutoConnect();
     void TakeSnapshot();
     void StartRecording();
     void StopRecording();
 
-    // View의 타이머에서 호출하여 갱신된 프레임을 반환
-    cv::Mat ProcessAndGetFrame(int targetWidth, int targetHeight);
+    // 뷰(LiveView 등)에서 렌더링에 사용할 프레임 획득
+    cv::Mat ProcessAndGetFrame(int targetW, int targetH);
 
-    // View에 바인딩할 상태 값
-    std::string GetStatus() const;
     bool IsStreaming() const;
+    std::string GetStatus() const;
+    
+    // UI 쪽에서 현재 녹화 상태를 읽어올 때 사용 (버튼 색상 등 제어용)
+    bool IsRecording() const;
 };
 
 #endif // MAIN_VIEW_MODEL_H
