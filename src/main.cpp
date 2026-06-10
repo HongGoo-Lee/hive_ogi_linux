@@ -126,8 +126,5 @@ int main() {
 
     LOG_INFO("Application exiting");
     
-    // [수정됨] 유령 프로세스(포트 꼬임) 방지를 위해 exit(0) 대신 return 0; 를 사용합니다.
-    // 이렇게 해야 CameraManager 등의 C++ 소멸자(Destructor)가 정상적으로 호출되어
-    // rc_genicam_api의 clearSystems() 자원 반환이 안전하게 이루어집니다.
     return 0;
 }

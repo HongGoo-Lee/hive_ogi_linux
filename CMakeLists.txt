@@ -55,7 +55,9 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     "src/*.cpp"
     "src/*.h")
 
-add_executable(hive_ogi_linux ${SOURCES})
+add_executable(hive_ogi_linux ${SOURCES}
+    src/Views/ViewState.h
+    src/Views/LiveView.cpp)
 
 target_include_directories(hive_ogi_linux PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
